@@ -7,4 +7,4 @@ A "disguised coverage" is defined as:
 - 2 or more players not initally lined up as a rusher blitzing the quarterback
 
 ## Goal
-Design a model that NFL offenses could use to alert their Quarterback if the opposing defese is in a disguised coverage.
+Design a model that NFL offenses could use to alert their quarterback if the opposing defese is in a disguised coverage.
