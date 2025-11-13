@@ -1,0 +1,477 @@
+---
+title: "Disguised Defense Model - Zach Rose"
+output: html_document
+date: "2025-09-17"
+---
+
+## Overview
+
+One of the most common ways that NFL defenses are able to confuse their opponents is by disguising their coverage. This could be done in a variety of ways, but one of the most effective is by either blitzing players that were not lined up near the LOS, or dropping players into coverage that were lined up at the LOS. The extra second that it could take a quarterback to process how many players are rushing him could be the difference between an explosive play and a sack. Disguising coverage in this way has become a common strategy used by all teams in recent years, and in this project I aim to help offenses by predicting if a given play will be a disguised look.
+
+
+### Read in data and libraries:
+```{r message=FALSE}
+setwd("~/Desktop/Big data bowl/data")
+games <- read.csv('games.csv')
+player_play <- read.csv('player_play.csv')
+plays <- read.csv('plays.csv')
+players <- read.csv('players.csv')
+week1 <- read.csv('tracking_week_1.csv')
+
+library(tidyverse)
+library(dplyr)
+library(xgboost)
+library(knitr)
+library(DT)
+
+
+```
+
+
+### For the following portion I only look at week 1, but later will extrapolate the process to include all given weeks.
+
+### The data was filtered and only certain plays were kept. All plays that were called back due to a penalty were excluded, as well as all plays that took place within 2 yards of an endzone or in the last 30 seconds of a half. Furthurmore, running plays and designed QB rollouts were also excluded.
+```{r}
+dropbacks_1 <- plays %>% 
+    left_join(games, by = 'gameId') %>% 
+    mutate(gameClock_seconds = as.numeric(substr(gameClock, 1, 2)) * 60 + as.numeric(substr(gameClock, 4, 5))) %>%
+    filter(week == 1,
+           playNullifiedByPenalty == 'N',
+           absoluteYardlineNumber > 12,
+           absoluteYardlineNumber < 108,
+           isDropback == T,
+           qbSpike == F,
+           dropbackType %in% c('TRADITIONAL', 'SCRAMBLE'),
+           !(quarter %in% c(2, 4) & gameClock_seconds < 30))
+```
+
+### The dataset includes whether or not a given player was an initial pass rusher. This was the only metric used to determine if a player was rushing. The amount of rushers for a given play was determined. 
+
+```{r message = FALSE}
+rushers_per_play_1 <- player_play %>% 
+    semi_join(dropbacks_1, by = c('gameId', 'playId')) %>% 
+    group_by(gameId, playId) %>% 
+    summarise(rushers = sum(wasInitialPassRusher, na.rm = T))
+
+datatable(rushers_per_play_1, options = list(scrollX = T))
+```
+
+### Using the player location data, the position of each defensive player on the field at the time of the stap was determined. In the future, it might be interesting to look at the players one second (or more) before the snap which would give the QB more time to process what might happen. 
+```{r}
+defensive_positions <- c('CB', 'DE', 'DT', 'FS', 'ILB', 'LB', 'MLB', 'NT', 'OLB', 'SS')
+player_locations_1 <- week1 %>% 
+    filter(frameType == 'SNAP') %>% 
+    select(gameId, playId, nflId, frameId) %>% 
+    mutate(check_frame = frameId) %>% 
+    select(-frameId) %>% 
+    left_join(players, by = 'nflId') %>% 
+    filter(position %in% defensive_positions) %>% 
+    select(gameId, playId, nflId, check_frame, displayName) %>% 
+    left_join(week1, by = c('gameId', 'playId', 'nflId')) %>% 
+    semi_join(dropbacks_1, by = c('gameId', 'playId')) %>% 
+    filter(check_frame == frameId) %>% 
+    select(gameId, playId, nflId, displayName.x, x, y, playDirection) %>% 
+    rename(player.x = x,
+           player.y = y)
+datatable(player_locations_1, options = list(scrollX = T))
+```
+
+### The location data was also able to give us the coordinates of the LOS for each play. This dataframe was joined with the player location dataframe to get all relevant coordinates for a given play. 
+```{r}
+LOS_1 <- week1 %>% 
+    filter(frameType == 'SNAP',
+           displayName == 'football') %>% 
+    select(gameId, playId, x, y)
+
+locations_1 <- player_locations_1 %>% 
+  left_join(LOS_1, by = c('gameId', 'playId')) %>% 
+    rename(los.x = x, los.y = y)
+
+datatable(locations_1, options = list(scrollX = T))
+```
+
+### The amount of players showing blitz on a given play was determined. To do this, a box was created with the front line being the LOS, each side edge being 9 yards off of the ball, and the back edge 15% of the way between the closest player to the LOS and the farthest one. By creating the back line like this, the box automatically adjusts when the defense puts all of their players close to the LOS.
+```{r message=FALSE}
+show_blitz_right_1 <- locations_1 %>% 
+    filter(playDirection == 'right') %>%
+    group_by(gameId, playId) %>% 
+    mutate(back_line = abs(min(player.x) - max(player.x))*.15 + min(player.x)) %>% 
+    ungroup() %>% 
+    mutate(blitzing = case_when(
+      player.x < back_line & player.y < los.y +9 & player.y > los.y -9 ~ T,
+      .default = F)) %>% 
+    filter(blitzing == T) %>% 
+    group_by(gameId, playId) %>% 
+    summarise(potentials = sum(blitzing))
+  
+  
+show_blitz_left_1 <- locations_1 %>% 
+  filter(playDirection == 'left') %>%
+  group_by(gameId, playId) %>% 
+  mutate(back_line = max(player.x) - abs(min(player.x) - max(player.x))*.15) %>% 
+  ungroup() %>% 
+  mutate(blitzing = case_when(
+    player.x > back_line & player.y < los.y +10 & player.y > los.y -10 ~ T,
+    .default = F)) %>% 
+  filter(blitzing == T) %>% 
+  group_by(gameId, playId) %>% 
+  summarise(potentials = sum(blitzing))
+  
+show_blitz_1 <- rbind(show_blitz_right_1, show_blitz_left_1) %>% 
+  filter(potentials != 1)
+datatable(show_blitz_1, options = list(scrollX = T))
+
+```
+
+### Below is a play from the Rams vs Bills game in 2022. The box shows the 4 players that are labeled as potential rushers.
+```{r}
+play <- locations_1 %>% 
+  filter(gameId == 2022090800, playId == 364)
+
+knitr::include_graphics("data/Show_blitz_ss.png")
+
+print(ggplot(play, aes(x = player.x, y = player.y)) +
+  geom_point()+
+  geom_vline(xintercept = play$los.x[1], color = 'blue') +
+  geom_hline(yintercept = play$los.y[1] + 9) +
+  geom_hline(yintercept = play$los.y[1] - 9) +
+  geom_vline(xintercept = abs(min(play$player.x) - max(play$player.x)) * 0.15 + min(play$player.x)))
+
+
+
+```
+
+### The amount of players disguising their plan was determined. Diff is the amount of rushers per play minus the amount of potentials. If it is positive, potentials did not blitz and if it is negative non-potentials blitzed.
+```{r}
+disguise_1 <- show_blitz_1 %>% 
+    ungroup() %>% 
+    left_join(rushers_per_play_1, by = c('gameId', 'playId')) %>% 
+    mutate(diff = rushers - potentials)
+              
+datatable(disguise_1, options = list(scrollX = T))
+```
+
+### This process was completed for all weeks
+```{r message=FALSE}
+setwd("~/Desktop/Big data bowl/data")
+week2 <- read.csv('tracking_week_2.csv')
+week3 <- read.csv('tracking_week_3.csv')
+week4 <- read.csv('tracking_week_4.csv')
+week5 <- read.csv('tracking_week_5.csv')
+week6 <- read.csv('tracking_week_6.csv')
+week7 <- read.csv('tracking_week_7.csv')
+week8 <- read.csv('tracking_week_8.csv')
+week9 <- read.csv('tracking_week_9.csv')
+
+get_disguise <- function(tracking_df, week.x) {
+  dropbacks <- plays %>% 
+    left_join(games, by = 'gameId') %>% 
+    mutate(gameClock_seconds = as.numeric(substr(gameClock, 1, 2)) * 60 + as.numeric(substr(gameClock, 4, 5))) %>%
+    filter(week == week.x,
+           playNullifiedByPenalty == 'N',
+           absoluteYardlineNumber > 12,
+           absoluteYardlineNumber < 108,
+           isDropback == T,
+           qbSpike == F,
+           dropbackType %in% c('TRADITIONAL', 'SCRAMBLE'),
+           !(quarter %in% c(2, 4) & gameClock_seconds < 30))
+  
+  rushers_per_play <- player_play %>% 
+    semi_join(dropbacks, by = c('gameId', 'playId')) %>% 
+    group_by(gameId, playId) %>% 
+    summarise(rushers = sum(wasInitialPassRusher, na.rm = T))
+  
+  player_locations <- tracking_df %>% 
+    filter(frameType == 'SNAP') %>% 
+    select(gameId, playId, nflId, frameId) %>% 
+    mutate(check_frame = frameId) %>% 
+    select(-frameId) %>% 
+    left_join(players, by = 'nflId') %>% 
+    filter(position %in% defensive_positions) %>% 
+    select(gameId, playId, nflId, check_frame, displayName) %>% 
+    left_join(tracking_df, by = c('gameId', 'playId', 'nflId')) %>% 
+    semi_join(dropbacks, by = c('gameId', 'playId')) %>% 
+    filter(check_frame == frameId) %>% 
+    select(gameId, playId, nflId, displayName.x, x, y, playDirection) %>% 
+    rename(player.x = x,
+           player.y = y)
+  
+  LOS <- tracking_df %>% 
+    filter(frameType == 'SNAP',
+           displayName == 'football') %>% 
+    select(gameId, playId, x, y)
+
+  locations <- player_locations %>% 
+   left_join(LOS, by = c('gameId', 'playId')) %>% 
+      rename(los.x = x, los.y = y)
+
+  show_blitz_right <- locations %>% 
+    filter(playDirection == 'right') %>%
+    group_by(gameId, playId) %>% 
+    mutate(back_line = abs(min(player.x) - max(player.x))*.15 + min(player.x)) %>% 
+    ungroup() %>% 
+    mutate(blitzing = case_when(
+      player.x < back_line & player.y < los.y +9 & player.y > los.y -9 ~ T,
+      .default = F)) %>% 
+    filter(blitzing == T) %>% 
+    group_by(gameId, playId) %>% 
+    summarise(potentials = sum(blitzing))
+  
+  show_blitz_left <- locations %>% 
+    filter(playDirection == 'left') %>%
+    group_by(gameId, playId) %>% 
+    mutate(back_line = max(player.x) - abs(min(player.x) - max(player.x))*.15) %>% 
+    ungroup() %>% 
+    mutate(blitzing = case_when(
+      player.x > back_line & player.y < los.y +10 & player.y > los.y -10 ~ T,
+      .default = F)) %>% 
+    filter(blitzing == T) %>% 
+    group_by(gameId, playId) %>% 
+    summarise(potentials = sum(blitzing))
+  
+  show_blitz <- rbind(show_blitz_right, show_blitz_left) %>% 
+    filter(potentials != 1)
+  
+  disguise <- show_blitz %>% 
+    ungroup() %>% 
+    left_join(rushers_per_play, by = c('gameId', 'playId')) %>% 
+    mutate(diff = rushers - potentials)
+
+return(disguise)
+}
+
+disguise_list <- list()
+
+for (i in 1:9) {
+  disguise_list[[i]] <- get_disguise(get(paste0("week", i)), i)
+}
+disguise_all <- bind_rows(disguise_list)
+datatable(disguise_all, options = list(scrollX = T))
+
+```
+
+### Here is a quick visualization of defensive success rates by diff. Although it is less frequent, plays that are disguised are more successful on average. 
+```{r}
+dropbacks <- plays %>% 
+    left_join(games, by = 'gameId') %>% 
+    mutate(gameClock_seconds = as.numeric(substr(gameClock, 1, 2)) * 60 + as.numeric(substr(gameClock, 4, 5))) %>%
+    filter(
+           playNullifiedByPenalty == 'N',
+           absoluteYardlineNumber > 12,
+           absoluteYardlineNumber < 108,
+           isDropback == T,
+           qbSpike == F,
+           dropbackType %in% c('TRADITIONAL', 'SCRAMBLE'),
+           !(quarter %in% c(2, 4) & gameClock_seconds < 30))
+
+success <- dropbacks %>%
+    select(gameId, playId, down, yardsToGo, possessionTeam, defensiveTeam, yardsGained) %>% 
+    mutate(successful_play_for_defense = case_when(
+      down == 1 & yardsGained >= .4*yardsToGo ~ F,
+      down == 2 & yardsGained >= .6*yardsToGo ~F,
+      (down == 3 | down == 4) & yardsGained >= yardsToGo ~ F,
+      .default = T
+    )) %>% 
+    select(gameId, playId, successful_play_for_defense)
+
+disguise_success <- disguise_all %>% 
+  left_join(success, by = c('gameId' = 'gameId', 'playId' = 'playId'))
+
+disguise_success <- disguise_success %>% 
+  group_by(diff) %>% 
+  summarise(count = n(),
+            success = sum(successful_play_for_defense)) %>% 
+  filter(count > 50) %>% 
+  mutate(success_percent = success/count)
+
+ggplot(disguise_success, aes(x = factor(diff), y = success_percent)) +
+  geom_col(fill = "steelblue", width = 0.6) +
+  geom_text(aes(label = paste0("Count: ", count)), vjust = -0.5, size = 3.5) +
+  scale_y_continuous(limits = c(0, 1.05)) +
+  labs(
+    title = "Disguise Success by Diff",
+    subtitle = "Left side has more blitzers than expected and right side has less than expected",
+    x = "Diff",
+    y = "Success Percent"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+### The data was prepared to be put in an XGBoost model matrix. A disguised coverage was defined as 2 or more players blitzing that were not initially in the box, or 2 or more players that were initially in the box not blitzing. The variables used to predict if a play was a disguised coverage were:
+* Potential Rushers (Players in the created box)
+* Down
+* Yards to go
+* Down*Yards to go
+* Defensive team (to account for tendencies)
+* Distance to end zone
+* Quarter
+* Offensive formation
+* Defensive win probability
+* Receiver Alignment
+
+
+```{r}
+disguise_all_model <- disguise_all %>% left_join(plays, by = c('gameId', 'playId')) %>% 
+  mutate(id = row_number()) %>% 
+  mutate(was_disguised_coverage = ifelse(abs(diff)>=2, 1, 0)) %>% 
+  mutate(distance_to_end_zone = 
+           case_when(
+             is.na(yardlineSide) ~ 50,
+             defensiveTeam == yardlineSide ~ yardlineNumber,
+             defensiveTeam != yardlineSide ~ (50-yardlineNumber)+50
+           )) %>%
+  mutate(down_with_distance = down*yardsToGo) %>% 
+  left_join(games, by = 'gameId') %>% 
+  mutate(defense_lead = case_when(
+    homeTeamAbbr == defensiveTeam ~ (preSnapHomeScore - preSnapVisitorScore),
+    visitorTeamAbbr == defensiveTeam ~ (preSnapVisitorScore - preSnapHomeScore)),
+    defense_win_prob = case_when(
+      homeTeamAbbr == defensiveTeam ~ (preSnapHomeTeamWinProbability - preSnapVisitorTeamWinProbability),
+      visitorTeamAbbr == defensiveTeam ~ (preSnapVisitorTeamWinProbability - preSnapHomeTeamWinProbability)
+    ))
+  
+variables <- c("potentials", "down", "yardsToGo", "defensiveTeam",
+               "distance_to_end_zone", "down_with_distance", 
+               "quarter", "offenseFormation", "defense_win_prob", "receiverAlignment", 'was_disguised_coverage')
+predictors <- setdiff(variables, "was_disguised_coverage")
+
+
+
+disguise_all_model <- disguise_all_model %>% 
+  mutate(defensiveTeam = factor(defensiveTeam),
+         offenseFormation = factor(offenseFormation),
+         receiverAlignment = factor(receiverAlignment)) %>% 
+  mutate(id = 1:nrow(disguise_all_model)) %>% 
+  select(gameId, playId, id, all_of(variables))
+
+datatable(disguise_all_model, options = list(scrollX = T))
+  
+```
+
+### 80% of the data was used as training data and the other 20% was set aside for testing data. The model was trained using the training data and then made predictions on the play in the test set. After making predictions, key metrics determining the model's effectiveness were stored and the process was repeated with a different set of training data. This was done 10 times.
+```{r}
+n <- nrow(disguise_all_model)
+train_len <- floor(.8 * n)
+
+disguise_all_model <- disguise_all_model %>% mutate(id = 1:n)
+
+results <- data.frame(
+  accuracy = numeric(),
+  TPR = numeric(),
+  PPV = numeric()
+)
+
+set.seed(1228)
+n <- 10
+
+for(i in 1:n){
+  set.seed(1228 + i)
+  train_data <- disguise_all_model %>% 
+  slice_sample(n = train_len) %>% 
+  select(all_of(c('id', variables)))
+
+  test_data <- disguise_all_model %>% 
+    anti_join(y = train_data, by = "id") %>% 
+    select(all_of(c('id', variables))) 
+
+  y_train <- train_data$was_disguised_coverage
+  y_test <- test_data$was_disguised_coverage
+
+  x_train <- model.matrix(~. -1, data = train_data %>% select(all_of(predictors)))
+  x_test  <- model.matrix(~. -1, data = test_data %>% select(all_of(predictors)))
+  
+  dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+  dtest <- xgb.DMatrix(data = x_test, label = y_test)
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    scale_pos_weight = sum(y_train == 0) / sum(y_train == 1))
+  
+  xgb_model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 100)
+  
+  train_pred <- predict(xgb_model, dtrain)
+  test_pred <- predict(xgb_model, dtest)
+  
+  len = length(y_test)
+  TP <- sum(y_test == 1 & test_pred >= 0.5)
+  FP <- sum(y_test == 0 & test_pred >= 0.5)
+  TN <- sum(y_test == 0 & test_pred < 0.5)
+  FN <- sum(y_test == 1 & test_pred < 0.5)
+  
+  accuracy <- (TP + TN) / (TP + TN + FP + FN)
+  TPR <- TP / (TP + FN)
+  PPV <- TP / (TP + FP)
+  
+  results <- rbind(results, data.frame(accuracy, TPR, PPV))
+
+}
+
+
+
+
+```
+
+### The model was evaluated by looking at the following metrics:
+* Accuracy: the percentage of plays correctly predicted
+* True Positive Rate (TPR): The percentage of disguised coverages that were correctly predicted
+* Positive Predictive Value (PPV): The percentage of predicted disguised coverages that were actually disguised coverages.
+```{r}
+accuracy <- mean(results$accuracy)*100
+TPR <- mean(results$TPR)*100
+PPV <- mean(results$PPV)*100
+
+cat("Accuracy:", round(accuracy,2),
+    "True Positive Rate:", round(TPR, 2),
+    "PPV:", round(PPV, 2))
+
+
+```
+
+### Below you can see the most important variables used to predict disguised coverages.
+```{r}
+importance <- xgb.importance(model = xgb_model)
+importance_clean <- importance %>%
+  mutate(
+    group = case_when(
+      str_detect(Feature, "^offenseFormation") ~ "offenseFormation",
+      str_detect(Feature, "^receiverAlignment") ~ "receiverAlignment",
+      str_detect(Feature, "^defensiveTeam") ~ "defensiveTeam",
+      TRUE ~ Feature
+    )) %>% 
+  group_by(group) %>% 
+  summarise(Gain = sum(Gain),
+            Cover = sum(Cover),
+            Frequency = sum(Frequency))
+
+
+
+ggplot(importance_clean, aes(x = reorder(group, Gain), y = Gain)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Feature Importance",
+    x = "Feature Group",
+    y = "Total Gain"
+  ) +
+  theme_minimal()
+```
+
+## Example Play:
+https://www.youtube.com/watch?v=dfjbUPXC-Fk
+
+In the above play, the Panthers lined 7 people up at the LOS, but only 5 rushed, indicating a disguised coverage. The model predicted that in this scenario there was a 90% chance of a disguised coverage. Because of the situation, it can be assumed that 2 or more of the players lined up at the line of scrimmage would drop back into coverage. With this information, Stafford could have taken an extra second to scan the field instead of rushing his throw. If he did this, he could have seen an easy completion to the TE on a simple out route instead of throwing a bad ball into heavy coverage which resulted in a pick 6. This is one of the many ways in which this model could be used to help quarterbacks make better decisions. 
+
+
+## Conclusions:
+The model is generally effective. It correctly predicts whether or not a play is disguised ~90% of the time. ~75% of disguised plays are correctly predicted, and ~60% of predicted disguised plays are actually disguised. This model could be used by NFL offenses to alert a QB if he should expect a different amount of rushers than the defense is showing and help him in breaking down the defense and making a better decision.
+
+
+
+
